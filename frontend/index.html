@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cinescope</title>
+  <link rel="stylesheet" href="style.css" />
+  <!-- favicon emoji, pas besoin de fichier -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>" />
+</head>
+<body>
+
+  <!-- barre de nav -->
+  <nav class="navbar">
+    <a href="#" class="nav-brand">
+      <span class="nav-dot"></span>
+      cinescope
+    </a>
+    <div class="nav-right">
+      <span class="nav-mode"><span id="mode-indicator">...</span></span>
+      <span class="nav-count"><span id="movie-count">0</span> films</span>
+    </div>
+  </nav>
+
+  <main class="main">
+    <div class="header">
+      <div class="header-top">
+        <div>
+          <h1>Catalogue</h1>
+          <p>Films populaires via TMDB ou notre collection interne.</p>
+        </div>
+      </div>
+
+      <!-- recherche + boutons limite -->
+      <div class="search-row">
+        <div class="search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+          </svg>
+          <input type="text" class="search-input" id="search-input" placeholder="Rechercher un film, realisateur, genre..." autocomplete="off" />
+          <button class="search-clear" id="search-clear">&times;</button>
+        </div>
+        <div class="controls">
+          <button class="limit-btn" data-limit="6">6</button>
+          <button class="limit-btn" data-limit="12">12</button>
+          <button class="limit-btn active" data-limit="20">20</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="results-info" id="results-info"></div>
+    <div id="movies-grid" class="movies-grid"></div>
+  </main>
+
+  <footer class="footer">
+    <span>cinescope &copy; 2025</span>
+    <a href="https://www.themoviedb.org/" target="_blank" rel="noopener">TMDB</a>
+  </footer>
+
+  <!-- modal pour les details du film -->
+  <div class="modal-overlay" id="movie-modal">
+    <div class="modal-container" id="modal-content"></div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
