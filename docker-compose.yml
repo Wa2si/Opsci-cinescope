@@ -1,0 +1,29 @@
+# docker compose pour lancer le back + front
+# usage: docker compose up --build
+
+services:
+  backend:
+    build: ./backend
+    image: films-backend
+    container_name: films-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+    networks:
+      - films-net
+
+  frontend:
+    build: ./frontend
+    image: films-frontend
+    container_name: films-frontend
+    ports:
+      - "8080:80"    # on mappe le 80 de nginx sur 8080
+    depends_on:
+      - backend
+    networks:
+      - films-net
+
+networks:
+  films-net:
+    driver: bridge
