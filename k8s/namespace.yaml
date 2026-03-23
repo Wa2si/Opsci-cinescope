@@ -1,0 +1,5 @@
+# namespace dedie pour isoler nos ressources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cinescope

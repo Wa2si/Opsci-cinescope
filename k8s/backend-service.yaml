@@ -1,0 +1,18 @@
+# service interne pour le backend (ClusterIP = pas accessible de l'exterieur)
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: cinescope
+  labels:
+    app: cinescope
+    tier: backend
+spec:
+  selector:
+    app: cinescope
+    tier: backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP

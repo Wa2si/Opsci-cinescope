@@ -1,0 +1,10 @@
+# config partagee entre les pods
+# la cle tmdb est vide par defaut, faut la remplir si on veut le mode live
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cinescope-config
+  namespace: cinescope
+data:
+  ENV: "production"
+  TMDB_API_KEY: ""

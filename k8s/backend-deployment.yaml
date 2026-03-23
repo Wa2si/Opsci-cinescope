@@ -1,0 +1,50 @@
+# deployment du backend fastapi
+# 2 replicas, on utilise /hello comme health check
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: cinescope
+  labels:
+    app: cinescope
+    tier: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cinescope
+      tier: backend
+  template:
+    metadata:
+      labels:
+        app: cinescope
+        tier: backend
+    spec:
+      containers:
+        - name: backend
+          image: films-backend:latest
+          imagePullPolicy: Never   # on utilise les images locales de minikube
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: cinescope-config
+          readinessProbe:
+            httpGet:
+              path: /hello
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /hello
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"

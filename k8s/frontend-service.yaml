@@ -1,0 +1,19 @@
+# service du front en NodePort pour pouvoir y acceder depuis le navigateur
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: cinescope
+  labels:
+    app: cinescope
+    tier: frontend
+spec:
+  selector:
+    app: cinescope
+    tier: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+      nodePort: 30080
+  type: NodePort
