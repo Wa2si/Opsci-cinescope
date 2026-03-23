@@ -1,0 +1,46 @@
+# pipeline CI/CD gitlab
+# 3 stages: test, build des images docker, deploy (simule)
+
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+# --- tests ---
+test-backend:
+  stage: test
+  image: python:3.11-slim
+  cache:
+    paths:
+      - .cache/pip
+  script:
+    - cd backend
+    - pip install -r requirements.txt
+    - pytest test_main.py -v
+
+# --- build des images docker ---
+build-backend:
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  script:
+    - docker build -t films-backend ./backend
+
+build-frontend:
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  script:
+    - docker build -t films-frontend ./frontend
+
+# --- deploy (pour l'instant c'est juste un echo) ---
+deploy:
+  stage: deploy
+  script:
+    - echo "deploiement de films-backend et films-frontend..."
+    - echo "deploiement OK (simule)"
