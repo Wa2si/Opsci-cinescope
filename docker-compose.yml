@@ -10,6 +10,9 @@ services:
       - "8000:8000"
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY:-}
+      - DB_PATH=/data/films.db     # db dans le volume pour la persistance
+    volumes:
+      - films_db:/data             # les donnees survivent aux redemarrages
     networks:
       - films-net
 
@@ -27,3 +30,6 @@ services:
 networks:
   films-net:
     driver: bridge
+
+volumes:
+  films_db:    # volume nomme pour persister la base sqlite

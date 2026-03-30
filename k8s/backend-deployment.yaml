@@ -41,6 +41,12 @@ spec:
               port: 8000
             initialDelaySeconds: 10
             periodSeconds: 30
+          env:
+            - name: DB_PATH
+              value: /data/films.db
+          volumeMounts:
+            - name: films-data
+              mountPath: /data    # la db sqlite est stockee ici
           resources:
             requests:
               memory: "64Mi"
@@ -48,3 +54,6 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
+      volumes:
+        - name: films-data
+          emptyDir: {}    # repart a zero si le pod redémarre, le refresh le repopule

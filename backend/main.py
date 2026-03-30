@@ -1,25 +1,28 @@
 import os
+import json
+import sqlite3
+import asyncio
 import httpx
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-app = FastAPI(title="Films API")
-
-# on autorise tout pour le CORS sinon le front peut pas fetch
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- config ---
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE = "https://api.themoviedb.org/3"
 
-# Films en dur au cas ou y'a pas de clé TMDB
-# les image_url c'est les vrais posters tmdb
+# chemin de la base de donnees (peut etre override par variable d'env)
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "films.db"))
+
+# intervalle de rafraichissement en secondes (1 heure)
+REFRESH_INTERVAL = 3600
+
+
+# --- donnees mock (fallback sans cle TMDB) ---
+
 MOCK_MOVIES = [
     {"id": 27205, "title": "Inception", "year": "2010", "director": "Christopher Nolan",
      "description": "Un voleur s'introduit dans les rêves des autres pour voler leurs secrets les plus enfouis.",
@@ -103,7 +106,6 @@ MOCK_MOVIES = [
      "genre": "Thriller"},
 ]
 
-# mapping des genre_ids tmdb vers des noms lisibles
 GENRE_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
     80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
@@ -113,7 +115,122 @@ GENRE_MAP = {
 }
 
 
-# fonction utilitaire pour appeler l'api tmdb
+# --- base de donnees SQLite ---
+
+def get_conn():
+    """retourne une connexion sqlite avec row factory (acces par nom de colonne)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """cree la table si elle existe pas encore"""
+    conn = get_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS films (
+            id           INTEGER PRIMARY KEY,
+            title        TEXT NOT NULL,
+            year         TEXT,
+            director     TEXT,
+            description  TEXT,
+            image_url    TEXT,
+            genre        TEXT,
+            backdrop_url TEXT,
+            tagline      TEXT,
+            runtime      INTEGER,
+            vote_average REAL,
+            vote_count   INTEGER,
+            trailer_key  TEXT,
+            cast_json    TEXT,
+            genres_json  TEXT,
+            has_detail   INTEGER DEFAULT 0,
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def count_films():
+    conn = get_conn()
+    n = conn.execute("SELECT COUNT(*) FROM films").fetchone()[0]
+    conn.close()
+    return n
+
+
+def upsert_film(conn, film):
+    """insert ou met a jour un film (on ecrase pas le director si on le connait deja)"""
+    conn.execute("""
+        INSERT INTO films (id, title, year, director, description, image_url, genre, updated_at)
+        VALUES (:id, :title, :year, :director, :description, :image_url, :genre, CURRENT_TIMESTAMP)
+        ON CONFLICT(id) DO UPDATE SET
+            title       = excluded.title,
+            year        = excluded.year,
+            description = excluded.description,
+            image_url   = excluded.image_url,
+            genre       = excluded.genre,
+            director    = CASE
+                WHEN excluded.director != 'N/A' THEN excluded.director
+                ELSE films.director
+            END,
+            updated_at  = CURRENT_TIMESTAMP
+    """, film)
+
+
+def upsert_detail(conn, detail):
+    """met a jour les champs detail d'un film (trailer, cast, etc.)"""
+    conn.execute("""
+        UPDATE films SET
+            director     = :director,
+            backdrop_url = :backdrop_url,
+            tagline      = :tagline,
+            runtime      = :runtime,
+            vote_average = :vote_average,
+            vote_count   = :vote_count,
+            trailer_key  = :trailer_key,
+            cast_json    = :cast_json,
+            genres_json  = :genres_json,
+            has_detail   = 1,
+            updated_at   = CURRENT_TIMESTAMP
+        WHERE id = :id
+    """, detail)
+
+
+def get_films(limit=20):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM films ORDER BY updated_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_film_by_id(film_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def search_in_db(query, limit=20):
+    """recherche dans la db par titre, realisateur, genre, description"""
+    q = f"%{query}%"
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT * FROM films
+        WHERE lower(title)       LIKE lower(?)
+           OR lower(director)    LIKE lower(?)
+           OR lower(genre)       LIKE lower(?)
+           OR lower(description) LIKE lower(?)
+        LIMIT ?
+    """, (q, q, q, q, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# --- appels TMDB ---
+
 async def tmdb_get(endpoint, params=None):
     headers = {
         "Authorization": f"Bearer {TMDB_API_KEY}",
@@ -129,59 +246,125 @@ async def tmdb_get(endpoint, params=None):
         return res.json()
 
 
-def normalize_tmdb_movie(movie_data):
-    """transforme un film tmdb en notre format standard"""
-    genre_ids = movie_data.get("genre_ids", [])
-    # on prend juste le premier genre, flemme de gerer une liste
+def normalize_tmdb_movie(m):
+    """convertit un film tmdb au format de notre db"""
+    genre_ids = m.get("genre_ids", [])
     genre = GENRE_MAP.get(genre_ids[0], "Unknown") if genre_ids else "Unknown"
-    release = movie_data.get("release_date", "") or ""
-    poster = movie_data.get("poster_path") or ""
+    release = m.get("release_date", "") or ""
+    poster = m.get("poster_path") or ""
     return {
-        "id": movie_data.get("id"),
-        "title": movie_data.get("title", "Unknown"),
+        "id": m.get("id"),
+        "title": m.get("title", "Unknown"),
         "year": release[:4] if len(release) >= 4 else "N/A",
-        "director": "N/A",  # pas dispo dans /popular, faut un appel en plus
-        "description": movie_data.get("overview", ""),
+        "director": "N/A",  # pas dispo dans /popular, recupere au detail
+        "description": m.get("overview", ""),
         "image_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "",
         "genre": genre,
     }
 
 
-# --- Routes ---
+# --- tache de rafraichissement ---
+
+async def refresh_from_source():
+    """recupere les films depuis TMDB (ou mock) et met a jour la db"""
+    print("[refresh] debut du rafraichissement de la db...")
+    if TMDB_API_KEY:
+        try:
+            data = await tmdb_get("/movie/popular", {"language": "fr-FR", "page": 1})
+            films = [normalize_tmdb_movie(m) for m in data.get("results", [])][:20]
+            conn = get_conn()
+            for f in films:
+                upsert_film(conn, f)
+            conn.commit()
+            conn.close()
+            print(f"[refresh] {len(films)} films mis a jour depuis TMDB")
+            return
+        except Exception as e:
+            print(f"[refresh] erreur TMDB: {e}, fallback sur mock")
+
+    # pas de cle ou erreur → on charge les mocks
+    conn = get_conn()
+    for f in MOCK_MOVIES:
+        upsert_film(conn, f)
+    conn.commit()
+    conn.close()
+    print(f"[refresh] {len(MOCK_MOVIES)} films mock charges en db")
+
+
+async def refresh_loop():
+    """tourne en arriere-plan, rafraichit la db toutes les REFRESH_INTERVAL secondes"""
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL)
+        try:
+            await refresh_from_source()
+        except Exception as e:
+            print(f"[refresh] echec du cycle de rafraichissement: {e}")
+
+
+# --- demarrage de l'app ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # au demarrage : init db puis chargement initial si vide
+    init_db()
+    if count_films() == 0:
+        print("[startup] db vide, chargement initial...")
+        await refresh_from_source()
+    else:
+        print(f"[startup] db deja chargee ({count_films()} films)")
+
+    # lance la boucle de rafraichissement en arriere-plan
+    task = asyncio.create_task(refresh_loop())
+    yield
+    # a l'arret on annule la tache
+    task.cancel()
+
+
+app = FastAPI(title="Films API", lifespan=lifespan)
+
+# on autorise tout pour le CORS sinon le front peut pas fetch
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- routes ---
 
 @app.get("/hello")
 async def hello():
-    """health check basique"""
+    """health check + infos sur l'etat de la db"""
     mode = "tmdb" if TMDB_API_KEY else "mock"
-    return {"status": "ok", "mode": mode}
+    return {"status": "ok", "mode": mode, "films_en_db": count_films()}
 
 
 @app.get("/movies")
 async def get_movies(limit: int = Query(default=20, ge=1, le=100)):
-    if TMDB_API_KEY:
-        try:
-            data = await tmdb_get("/movie/popular", {"language": "fr-FR", "page": 1})
-            films = [normalize_tmdb_movie(m) for m in data.get("results", [])]
-            return films[:limit]
-        except httpx.HTTPStatusError as e:
-            # si la clé est invalide on fallback sur le mock
-            if e.response.status_code == 401:
-                return {"error": "Clé TMDB invalide", "fallback": MOCK_MOVIES[:limit]}
-            return {"error": f"Erreur TMDB ({e.response.status_code})", "fallback": MOCK_MOVIES[:limit]}
-        except httpx.RequestError:
-            return {"error": "TMDB injoignable", "fallback": MOCK_MOVIES[:limit]}
-    return MOCK_MOVIES[:limit]
+    """retourne les films depuis la db (pas d'appel TMDB direct)"""
+    return get_films(limit)
 
 
 @app.get("/movie/{movie_id}")
 async def get_movie_detail(movie_id: int = Path(...)):
-    """recup les details d'un film (avec videos + credits)"""
-    if TMDB_API_KEY:
+    """detail d'un film - si pas en cache on fetch TMDB et on stocke en db"""
+    film = get_film_by_id(movie_id)
+
+    # si on a deja le detail complet en db, on retourne direct
+    if film and film.get("has_detail"):
+        film["cast"] = json.loads(film["cast_json"] or "[]")
+        film["genres"] = json.loads(film["genres_json"] or "[]")
+        return film
+
+    # sinon on fetch le detail depuis TMDB et on le met en cache
+    if TMDB_API_KEY and film:
         try:
             data = await tmdb_get(
                 f"/movie/{movie_id}",
                 {"language": "fr-FR", "append_to_response": "videos,credits"},
             )
+
             # chercher le realisateur dans le crew
             director = "N/A"
             for person in data.get("credits", {}).get("crew", []):
@@ -189,84 +372,94 @@ async def get_movie_detail(movie_id: int = Path(...)):
                     director = person["name"]
                     break
 
-            # chercher un trailer youtube (fr de preference)
+            # trailer youtube (fr de preference)
             trailer_key = None
-            videos = data.get("videos", {}).get("results", [])
-            for v in videos:
+            for v in data.get("videos", {}).get("results", []):
                 if v.get("type") == "Trailer" and v.get("site") == "YouTube":
                     trailer_key = v["key"]
                     if v.get("iso_639_1") == "fr":
-                        break  # on garde le fr si on le trouve
+                        break
 
             # top 8 du casting
             cast_list = []
             for c in data.get("credits", {}).get("cast", [])[:8]:
-                photo_url = None
+                photo = None
                 if c.get("profile_path"):
-                    photo_url = f"https://image.tmdb.org/t/p/w185{c['profile_path']}"
+                    photo = f"https://image.tmdb.org/t/p/w185{c['profile_path']}"
                 cast_list.append({
                     "name": c["name"],
                     "character": c["character"],
-                    "photo": photo_url
+                    "photo": photo,
                 })
 
             genres = [g["name"] for g in data.get("genres", [])]
             backdrop = data.get("backdrop_path") or ""
             poster = data.get("poster_path") or ""
 
-            return {
-                "id": data["id"],
-                "title": data.get("title", "Unknown"),
-                "year": (data.get("release_date") or "")[:4],
+            detail = {
+                "id": movie_id,
                 "director": director,
-                "description": data.get("overview", ""),
-                "tagline": data.get("tagline", ""),
-                "image_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "",
                 "backdrop_url": f"https://image.tmdb.org/t/p/original{backdrop}" if backdrop else "",
-                "genre": ", ".join(genres),
-                "genres": genres,
+                "tagline": data.get("tagline", ""),
                 "runtime": data.get("runtime"),
                 "vote_average": data.get("vote_average"),
                 "vote_count": data.get("vote_count"),
                 "trailer_key": trailer_key,
-                "cast": cast_list,
+                "cast_json": json.dumps(cast_list),
+                "genres_json": json.dumps(genres),
             }
-        except httpx.HTTPStatusError:
-            pass  # on fallback sur le mock en dessous
-        except httpx.RequestError:
-            pass
 
-    # fallback mock si pas de clé ou erreur
-    for m in MOCK_MOVIES:
-        if m["id"] == movie_id:
-            return {**m, "tagline": "", "backdrop_url": "", "genres": [m["genre"]],
-                    "runtime": None, "vote_average": None, "vote_count": None,
-                    "trailer_key": None, "cast": []}
+            # on stocke le detail en db pour pas rappeler TMDB la prochaine fois
+            conn = get_conn()
+            upsert_detail(conn, detail)
+            conn.commit()
+            conn.close()
+
+            film = get_film_by_id(movie_id)
+            film["cast"] = cast_list
+            film["genres"] = genres
+            return film
+
+        except Exception:
+            pass  # fallback sur ce qu'on a en db
+
+    # pas de cle ou erreur : on retourne ce qu'on a en db
+    if film:
+        film["cast"] = json.loads(film.get("cast_json") or "[]")
+        film["genres"] = json.loads(film.get("genres_json") or "[]")
+        film.setdefault("backdrop_url", "")
+        film.setdefault("tagline", "")
+        film.setdefault("trailer_key", None)
+        return film
+
     return {"error": "Film non trouvé"}
 
 
 @app.get("/search")
 async def search_movies(q: str = Query(default="", min_length=0)):
-    query = q.strip().lower()
+    query = q.strip()
     if not query:
-        return MOCK_MOVIES
-    # si on a la clé on cherche sur tmdb directement
+        return get_films(20)
+
+    # si on a la cle on cherche sur tmdb et on stocke les resultats en db
     if TMDB_API_KEY:
         try:
             data = await tmdb_get("/search/movie", {"language": "fr-FR", "query": query})
-            return [normalize_tmdb_movie(m) for m in data.get("results", [])[:20]]
-        except (httpx.HTTPStatusError, httpx.RequestError):
-            pass  # fallback sur recherche locale
-    # recherche basique dans les mocks
-    res = [m for m in MOCK_MOVIES
-           if query in m["title"].lower()
-           or query in m["director"].lower()
-           or query in m["genre"].lower()
-           or query in m["description"].lower()]
-    return res
+            results = [normalize_tmdb_movie(m) for m in data.get("results", [])[:20]]
+            conn = get_conn()
+            for f in results:
+                upsert_film(conn, f)
+            conn.commit()
+            conn.close()
+            return results
+        except Exception:
+            pass
+
+    # fallback : recherche dans la db locale
+    return search_in_db(query)
 
 
-# --- Fichiers statiques (mode mono-conteneur) ---
+# --- fichiers statiques (mode mono-conteneur) ---
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
