@@ -1,5 +1,5 @@
-# pipeline CI/CD gitlab
-# 3 stages: test, build des images docker, deploy (simule)
+# pipeline CI/CD GitLab
+# 3 stages : test → build (push vers GitLab Registry) → deploy (simule)
 
 stages:
   - test
@@ -8,39 +8,74 @@ stages:
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # requis pour Docker-in-Docker sans TLS
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_HOST: "tcp://docker:2375"
 
-# --- tests ---
+# ──────────────────────────────────────────
+# STAGE TEST
+# ──────────────────────────────────────────
 test-backend:
   stage: test
   image: python:3.11-slim
   cache:
+    key: pip-$CI_COMMIT_REF_SLUG
     paths:
       - .cache/pip
   script:
     - cd backend
     - pip install -r requirements.txt
-    - pytest test_main.py -v
+    - pytest test_main.py -v --tb=short --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+    expire_in: 1 week
 
-# --- build des images docker ---
+# ──────────────────────────────────────────
+# STAGE BUILD – push vers GitLab Registry
+# ──────────────────────────────────────────
 build-backend:
   stage: build
   image: docker:24.0
   services:
     - docker:24.0-dind
+  needs: [test-backend]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
-    - docker build -t films-backend ./backend
+    - docker build -t "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA" ./backend
+    - docker push "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/backend:latest"
+    - docker push "$CI_REGISTRY_IMAGE/backend:latest"
 
 build-frontend:
   stage: build
   image: docker:24.0
   services:
     - docker:24.0-dind
+  needs: [test-backend]
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
-    - docker build -t films-frontend ./frontend
+    - docker build -t "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA" ./frontend
+    - docker push "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/frontend:latest"
+    - docker push "$CI_REGISTRY_IMAGE/frontend:latest"
 
-# --- deploy (pour l'instant c'est juste un echo) ---
+# ──────────────────────────────────────────
+# STAGE DEPLOY (simule, uniquement sur main)
+# ──────────────────────────────────────────
 deploy:
   stage: deploy
+  image: alpine:3.19
+  needs: [build-backend, build-frontend]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
   script:
-    - echo "deploiement de films-backend et films-frontend..."
-    - echo "deploiement OK (simule)"
+    - echo "=== Images publiees ==="
+    - echo "  backend  → $CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA"
+    - echo "  frontend → $CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA"
+    - echo "=== Deploiement simule OK ==="
+  environment:
+    name: production
