@@ -1,5 +1,4 @@
-# deployment du backend fastapi
-# 2 replicas, on utilise /hello comme health check
+# deployment du backend FastAPI
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,30 +22,26 @@ spec:
       containers:
         - name: backend
           image: films-backend:latest
-          imagePullPolicy: Never   # on utilise les images locales de minikube
+          imagePullPolicy: Never   # images locales (minikube)
           ports:
             - containerPort: 8000
           envFrom:
             - configMapRef:
                 name: cinescope-config
+            - secretRef:
+                name: cinescope-secret
           readinessProbe:
             httpGet:
               path: /hello
               port: 8000
-            initialDelaySeconds: 5
+            initialDelaySeconds: 10
             periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /hello
               port: 8000
-            initialDelaySeconds: 10
+            initialDelaySeconds: 20
             periodSeconds: 30
-          env:
-            - name: DB_PATH
-              value: /data/films.db
-          volumeMounts:
-            - name: films-data
-              mountPath: /data    # la db sqlite est stockee ici
           resources:
             requests:
               memory: "64Mi"
@@ -54,6 +49,3 @@ spec:
             limits:
               memory: "256Mi"
               cpu: "500m"
-      volumes:
-        - name: films-data
-          emptyDir: {}    # repart a zero si le pod redémarre, le refresh le repopule

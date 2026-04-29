@@ -1,0 +1,30 @@
+# ingress : un seul point d'entree pour le front et l'API
+# /api/* -> backend (on enleve le prefixe /api avant de transferer)
+# /*     -> frontend
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cinescope-ingress
+  namespace: cinescope
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cinescope.local
+      http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

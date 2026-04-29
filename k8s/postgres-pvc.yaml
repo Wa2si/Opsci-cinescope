@@ -1,0 +1,12 @@
+# volume persistant pour postgres : la db survit aux redemarrages du pod
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: cinescope
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

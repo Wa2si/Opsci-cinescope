@@ -1,0 +1,17 @@
+# service interne pour postgres - le backend l'appelle via "postgres:5432"
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: cinescope
+  labels:
+    app: cinescope
+    tier: db
+spec:
+  selector:
+    app: cinescope
+    tier: db
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP

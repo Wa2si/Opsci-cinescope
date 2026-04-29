@@ -1,5 +1,5 @@
-# config partagee entre les pods
-# la cle tmdb est vide par defaut, faut la remplir si on veut le mode live
+# config partagee (non sensible)
+# les secrets (cle TMDB, mdp postgres) sont dans secret.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,4 +7,7 @@ metadata:
   namespace: cinescope
 data:
   ENV: "production"
-  TMDB_API_KEY: ""
+  DB_HOST: "postgres"
+  DB_PORT: "5432"
+  DB_NAME: "cinescope"
+  DB_USER: "cinescope"
