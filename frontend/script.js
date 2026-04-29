@@ -4,7 +4,10 @@
   // url du backend, peut etre override par config.js dans docker
   const API_BASE = window.__API_BASE || "http://localhost:8000";
   let currentLimit = 20;
+  let currentPage = 1;
+  let totalPages = 1;
   let searchTimer = null;
+  let onlyFavs = false;   // filtre "mes favoris" actif ou pas
 
   // refs DOM
   const grid = document.getElementById("movies-grid");
@@ -17,6 +20,43 @@
   const searchClear = document.getElementById("search-clear");
   const modal = document.getElementById("movie-modal");
   const modalContent = document.getElementById("modal-content");
+  const pagination = document.getElementById("pagination");
+  const favToggle = document.getElementById("fav-toggle");
+  const favCount = document.getElementById("fav-count");
+
+  // --- Favoris (localStorage) ---
+  // On stocke un tableau d'IDs dans localStorage. Pas besoin de backend
+  // pour ca : ca reste local au navigateur, c'est ce qu'on veut.
+  const FAV_KEY = "cinescope_favs";
+
+  function loadFavs() {
+    try {
+      const raw = localStorage.getItem(FAV_KEY);
+      return new Set(raw ? JSON.parse(raw) : []);
+    } catch (e) {
+      return new Set();
+    }
+  }
+
+  function saveFavs(set) {
+    localStorage.setItem(FAV_KEY, JSON.stringify([...set]));
+  }
+
+  let favs = loadFavs();
+
+  function isFav(id) { return favs.has(id); }
+
+  function toggleFav(id) {
+    if (favs.has(id)) favs.delete(id);
+    else favs.add(id);
+    saveFavs(favs);
+    refreshFavCount();
+  }
+
+  function refreshFavCount() {
+    favCount.textContent = favs.size;
+  }
+  refreshFavCount();
 
   // effet blur navbar au scroll
   let ticking = false;
@@ -66,6 +106,7 @@
     card.style.animationDelay = `${index * 0.05}s`;
 
     const hasImg = movie.image_url && movie.image_url.length > 10;
+    const fav = isFav(movie.id);
 
     card.innerHTML = `
       <div class="card-poster">
@@ -75,12 +116,26 @@
           : `<div class="card-poster-fallback">🎬</div>`
         }
         <span class="card-badge">${movie.genre}</span>
+        <button class="fav-btn ${fav ? "active" : ""}" data-id="${movie.id}" title="${fav ? "Retirer des favoris" : "Ajouter aux favoris"}">${fav ? "♥" : "♡"}</button>
       </div>
       <div class="card-body">
         <div class="card-title">${movie.title}</div>
         <div class="card-meta">${movie.year}${movie.director && movie.director !== "N/A" ? ` · ${movie.director}` : ""}</div>
         <p class="card-desc">${movie.description}</p>
       </div>`;
+
+    // bouton coeur : on stop la propag pour pas ouvrir la modal
+    const favBtn = card.querySelector(".fav-btn");
+    favBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleFav(movie.id);
+      const nowFav = isFav(movie.id);
+      favBtn.classList.toggle("active", nowFav);
+      favBtn.textContent = nowFav ? "♥" : "♡";
+      favBtn.title = nowFav ? "Retirer des favoris" : "Ajouter aux favoris";
+      // si on est en mode "mes favoris" et qu'on retire, on re-render
+      if (onlyFavs && !nowFav) fetchMovies();
+    });
 
     // clic sur la carte -> ouvre le modal avec les details
     if (movie.id) {
@@ -114,6 +169,8 @@
         duree = `${h}h${min}`;
       }
 
+      const fav = isFav(movieId);
+
       modalContent.innerHTML = `
         <div class="modal-backdrop-wrap">
           ${data.backdrop_url ? `<img class="modal-backdrop" src="${data.backdrop_url}" alt="" />` : ""}
@@ -132,6 +189,7 @@
               ${duree ? `<span>${duree}</span>` : ""}
               ${stars ? `<span class="modal-rating">★ ${stars}</span>` : ""}
               ${data.vote_count ? `<span class="modal-votes">${data.vote_count.toLocaleString()} votes</span>` : ""}
+              <button class="modal-fav-btn ${fav ? "active" : ""}" id="modal-fav-btn">${fav ? "♥ Favori" : "♡ Ajouter aux favoris"}</button>
             </div>
             <div class="modal-genres">
               ${(data.genres || []).map(g => `<span class="modal-genre-tag">${g}</span>`).join("")}
@@ -172,15 +230,73 @@
                 </div>
               </div>
             ` : ""}
+            <div class="modal-similar-section" id="modal-similar-section" style="display:none">
+              <span class="modal-label">Films similaires</span>
+              <div class="modal-similar-grid" id="modal-similar-grid"></div>
+            </div>
           </div>
         </div>`;
 
       modalContent.querySelector(".modal-close").addEventListener("click", closeModal);
+
+      // bouton favori dans la modal
+      const modalFavBtn = modalContent.querySelector("#modal-fav-btn");
+      modalFavBtn.addEventListener("click", () => {
+        toggleFav(movieId);
+        const nowFav = isFav(movieId);
+        modalFavBtn.classList.toggle("active", nowFav);
+        modalFavBtn.textContent = nowFav ? "♥ Favori" : "♡ Ajouter aux favoris";
+        // sync avec le coeur sur la carte derriere si elle existe
+        const cardBtn = grid.querySelector(`.fav-btn[data-id="${movieId}"]`);
+        if (cardBtn) {
+          cardBtn.classList.toggle("active", nowFav);
+          cardBtn.textContent = nowFav ? "♥" : "♡";
+        }
+      });
+
+      // films similaires (chargement async, ne bloque pas l'ouverture de la modal)
+      loadSimilar(movieId);
+
     } catch (err) {
       modalContent.innerHTML = `
         <button class="modal-close" aria-label="Fermer">&times;</button>
         <div class="modal-error">Impossible de charger les détails du film.</div>`;
       modalContent.querySelector(".modal-close").addEventListener("click", closeModal);
+    }
+  }
+
+  async function loadSimilar(movieId) {
+    try {
+      const res = await fetch(`${API_BASE}/movie/${movieId}/similar`);
+      if (!res.ok) return;
+      const list = await res.json();
+      if (!Array.isArray(list) || list.length === 0) return;
+
+      const section = document.getElementById("modal-similar-section");
+      const wrap = document.getElementById("modal-similar-grid");
+      if (!section || !wrap) return;
+
+      wrap.innerHTML = list.slice(0, 6).map(m => `
+        <div class="modal-similar-item" data-id="${m.id}">
+          ${m.image_url
+            ? `<img src="${m.image_url}" alt="${m.title}" onerror="this.style.display='none'" />`
+            : `<div class="modal-similar-fallback">🎬</div>`}
+          <div class="modal-similar-title">${m.title}</div>
+          <div class="modal-similar-year">${m.year || ""}</div>
+        </div>
+      `).join("");
+
+      // clic sur un similar -> on rouvre la modal avec ce film
+      wrap.querySelectorAll(".modal-similar-item").forEach(el => {
+        el.addEventListener("click", () => {
+          const newId = parseInt(el.dataset.id, 10);
+          if (newId) openModal(newId);
+        });
+      });
+
+      section.style.display = "block";
+    } catch (e) {
+      // silencieux : on a deja l'essentiel de la modal, c'est juste un bonus
     }
   }
 
@@ -211,6 +327,15 @@
       </div>`;
   }
 
+  function showEmptyFavs() {
+    grid.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">♡</div>
+        <h3>Aucun favori</h3>
+        <p>Cliquez sur le cœur d'un film pour l'ajouter ici.</p>
+      </div>`;
+  }
+
   function showError(msg) {
     grid.innerHTML = `
       <div class="error-state">
@@ -221,12 +346,73 @@
       </div>`;
   }
 
+  // --- Pagination UI ---
+
+  function renderPagination() {
+    // pas de pagination si recherche, mode favoris, ou une seule page
+    if (searchInput.value.trim() || onlyFavs || totalPages <= 1) {
+      pagination.innerHTML = "";
+      return;
+    }
+    const prev = currentPage > 1
+      ? `<button class="pag-btn" data-page="${currentPage - 1}">← Précédent</button>`
+      : `<button class="pag-btn" disabled>← Précédent</button>`;
+    const next = currentPage < totalPages
+      ? `<button class="pag-btn" data-page="${currentPage + 1}">Suivant →</button>`
+      : `<button class="pag-btn" disabled>Suivant →</button>`;
+    pagination.innerHTML = `
+      ${prev}
+      <span class="pag-info">page ${currentPage} / ${totalPages}</span>
+      ${next}`;
+    pagination.querySelectorAll("[data-page]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        currentPage = parseInt(btn.dataset.page, 10);
+        fetchMovies();
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+    });
+  }
+
   // --- Fetch principal ---
 
   async function fetchMovies() {
     const query = searchInput.value.trim();
     showSkeletons(query ? 8 : currentLimit);
     resultsInfo.innerHTML = "";
+    pagination.innerHTML = "";
+
+    // cas mode favoris : on n'appelle pas le backend, on filtre les favs locaux
+    if (onlyFavs && !query) {
+      const ids = [...favs];
+      if (ids.length === 0) {
+        showEmptyFavs();
+        counter.textContent = 0;
+        return;
+      }
+      try {
+        // on recupere les details de chaque favori (les films sont en BDD vu
+        // qu'on les a forcement deja ouverts/charges au moins une fois)
+        const movies = [];
+        for (const id of ids) {
+          try {
+            const r = await fetch(`${API_BASE}/movie/${id}`);
+            const m = await r.json();
+            if (!m.error) movies.push(m);
+          } catch (e) { /* skip */ }
+        }
+        grid.innerHTML = "";
+        if (movies.length === 0) {
+          showEmptyFavs();
+        } else {
+          movies.forEach((m, i) => grid.appendChild(createCard(m, i)));
+        }
+        counter.textContent = movies.length;
+        resultsInfo.innerHTML = `<span>${movies.length}</span> favori${movies.length !== 1 ? "s" : ""}`;
+      } catch (e) {
+        showError("Erreur de chargement des favoris.");
+      }
+      return;
+    }
 
     try {
       // on construit l'url selon si c'est une recherche ou pas
@@ -234,15 +420,25 @@
       if (query) {
         url = `${API_BASE}/search?q=${encodeURIComponent(query)}`;
       } else {
-        url = `${API_BASE}/movies?limit=${currentLimit}`;
+        // mode pagine : on demande page+page_size
+        url = `${API_BASE}/movies?page=${currentPage}&page_size=${currentLimit}`;
       }
 
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
 
-      // parfois le backend renvoie {error, fallback} au lieu d'une liste
-      const movies = Array.isArray(data) ? data : data.fallback || [];
+      // selon le mode, le backend renvoie soit une liste (search), soit un objet pagine
+      let movies;
+      if (Array.isArray(data)) {
+        movies = data;
+        totalPages = 1;
+      } else if (data.items) {
+        movies = data.items;
+        totalPages = data.total_pages || 1;
+      } else {
+        movies = data.fallback || [];
+      }
 
       grid.innerHTML = "";
 
@@ -257,6 +453,8 @@
       if (query) {
         resultsInfo.innerHTML = `<span>${movies.length}</span> résultat${movies.length !== 1 ? "s" : ""} pour « ${query} »`;
       }
+
+      renderPagination();
 
       // check le mode (tmdb live ou mock)
       try {
@@ -278,7 +476,10 @@
     const hasValue = searchInput.value.length > 0;
     searchClear.classList.toggle("visible", hasValue);
     clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => fetchMovies(), 300);
+    searchTimer = setTimeout(() => {
+      currentPage = 1;   // une nouvelle recherche -> retour page 1
+      fetchMovies();
+    }, 300);
   });
 
   // bouton clear de la recherche
@@ -286,6 +487,7 @@
     searchInput.value = "";
     searchClear.classList.remove("visible");
     resultsInfo.innerHTML = "";
+    currentPage = 1;
     fetchMovies();
     searchInput.focus();
   });
@@ -296,8 +498,17 @@
       limitBtns.forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       currentLimit = parseInt(btn.dataset.limit, 10);
+      currentPage = 1;   // changer la taille -> retour page 1
       if (!searchInput.value.trim()) fetchMovies();
     });
+  });
+
+  // bouton "Mes favoris"
+  favToggle.addEventListener("click", () => {
+    onlyFavs = !onlyFavs;
+    favToggle.classList.toggle("active", onlyFavs);
+    currentPage = 1;
+    fetchMovies();
   });
 
   // on charge les films au demarrage
