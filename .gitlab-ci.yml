@@ -1,5 +1,5 @@
-# pipeline CI/CD GitLab
-# 3 stages : test → build (push vers GitLab Registry) → deploy (simule)
+# Pipeline GitLab CI : test -> build -> deploy
+# Le deploy est simulé (cf. rapport, on n'a pas de cluster externe).
 
 stages:
   - test
@@ -8,20 +8,36 @@ stages:
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
-  # requis pour Docker-in-Docker sans TLS
   DOCKER_TLS_CERTDIR: ""
   DOCKER_HOST: "tcp://docker:2375"
+  # Vars utilisées par le service postgres (job test)
+  POSTGRES_DB: cinescope
+  POSTGRES_USER: cinescope
+  POSTGRES_PASSWORD: cinescope
+  POSTGRES_HOST_AUTH_METHOD: trust
 
-# ──────────────────────────────────────────
-# STAGE TEST
-# ──────────────────────────────────────────
+
+# --- TEST ---
+# pytest sur le backend, avec une vraie postgres en service GitLab.
+# (Indispensable depuis qu'on est passés de SQLite à Postgres.)
 test-backend:
   stage: test
   image: python:3.11-slim
+  services:
+    - name: postgres:16-alpine
+      alias: postgres
+  variables:
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_NAME: cinescope
+    DB_USER: cinescope
+    DB_PASSWORD: cinescope
   cache:
     key: pip-$CI_COMMIT_REF_SLUG
     paths:
       - .cache/pip
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev > /dev/null
   script:
     - cd backend
     - pip install -r requirements.txt
@@ -32,9 +48,9 @@ test-backend:
       junit: backend/report.xml
     expire_in: 1 week
 
-# ──────────────────────────────────────────
-# STAGE BUILD – push vers GitLab Registry
-# ──────────────────────────────────────────
+
+# --- BUILD ---
+# Push des deux images dans la GitLab Container Registry (tag = SHA + latest).
 build-backend:
   stage: build
   image: docker:24.0
@@ -63,9 +79,10 @@ build-frontend:
     - docker tag "$CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE/frontend:latest"
     - docker push "$CI_REGISTRY_IMAGE/frontend:latest"
 
-# ──────────────────────────────────────────
-# STAGE DEPLOY (simule, uniquement sur main)
-# ──────────────────────────────────────────
+
+# --- DEPLOY ---
+# Sur un projet pro : kubectl apply / helm upgrade.
+# Ici on se contente d'afficher les images publiées (uniquement sur main).
 deploy:
   stage: deploy
   image: alpine:3.19
@@ -74,8 +91,8 @@ deploy:
     - if: $CI_COMMIT_BRANCH == "main"
   script:
     - echo "=== Images publiees ==="
-    - echo "  backend  → $CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA"
-    - echo "  frontend → $CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA"
+    - echo "  backend  -> $CI_REGISTRY_IMAGE/backend:$CI_COMMIT_SHORT_SHA"
+    - echo "  frontend -> $CI_REGISTRY_IMAGE/frontend:$CI_COMMIT_SHORT_SHA"
     - echo "=== Deploiement simule OK ==="
   environment:
     name: production
