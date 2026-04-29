@@ -1,166 +1,117 @@
 # Cinescope — Catalogue de Films
 
-Application web full-stack de catalogue de films avec FastAPI.
+Application web full-stack de catalogue de films (FastAPI + PostgreSQL + nginx),
+conteneurisée Docker et déployable sur Kubernetes.
 
 ## Architecture
 
 ```
-┌──────────────┐       ┌──────────────┐       ┌──────────────┐
-│   Frontend   │──────▶│   Backend    │──────▶│  TMDB API    │
-│  (nginx:80)  │ HTTP  │ (FastAPI:8000)│ HTTP │  (externe)   │
-└──────────────┘       └──────┬───────┘       └──────────────┘
-                              │
-                              ▼ (si pas de clé)
-                       ┌──────────────┐
-                       │  Mock Data   │
-                       │  (20 films)  │
-                       └──────────────┘
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│   Frontend   │─────▶│   Backend    │─────▶│  PostgreSQL  │
+│  nginx :8080 │ HTTP │ FastAPI :8000│ SQL  │     :5432    │
+└──────────────┘      └──────┬───────┘      └──────────────┘
+                             │
+                             ▼ (rafraichissement /h)
+                      ┌──────────────┐
+                      │  TMDB API    │  ← fallback mock si pas de cle
+                      └──────────────┘
 ```
 
 ## Demarrage rapide
 
-### Sans cle TMDB (donnees mockees)
+Tout se lance avec une commande :
 
 ```bash
-docker-compose up --build
+./start.sh        # ou : docker compose up --build
 ```
 
-Ouvrir http://localhost:8080 dans le navigateur.
+Puis ouvrir http://localhost:8080.
 
-### Avec cle TMDB
+### Avec une cle TMDB (optionnel)
 
-Creer un fichier `.env` a la racine :
+Pour basculer du mode mock vers les vrais films TMDB, créer un `.env` à la racine :
 
 ```
-TMDB_API_KEY=votre_cle_ici
+TMDB_API_KEY=votre_cle_v4_bearer
 ```
 
-Puis relancer :
+Et relancer.
 
-```bash
-docker-compose up --build
-```
+## Stack technique
 
-### Mode mono-conteneur (backend seul)
+| Couche | Choix | Justification |
+|---|---|---|
+| Front | HTML/CSS/JS vanilla | Pas de build, sert directement par nginx, suffisant pour ce périmètre |
+| Back | FastAPI (Python 3.11) | Async natif, OpenAPI auto-généré, courbe d'apprentissage rapide |
+| BDD | PostgreSQL 16 | SQL relationnel standard, large adoption pro, persistance via volume |
+| Conteneurisation | Docker + Compose | 3 services orchestrés (db, back, front) |
+| Orchestration | Kubernetes (Minikube) | Pods, Services, Ingress, ConfigMap, Secret, HPA |
+| CI/CD | GitLab CI | 3 stages (test → build → deploy), JUnit, push vers Registry |
 
-```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
+## Endpoints API
 
-Ouvrir http://localhost:8000 — le backend sert directement le frontend depuis `static/index.html`.
+| Méthode | Route | Description |
+|---|---|---|
+| GET | `/hello` | Health check + mode (tmdb/mock) |
+| GET | `/status` | Uptime, films en BDD, état général |
+| GET | `/movies?limit=N` | Liste des films (1 ≤ N ≤ 100) |
+| GET | `/movie/{id}` | Détail d'un film (cast, trailer, etc.) |
+| GET | `/search?q=X` | Recherche par titre/réalisateur/genre |
+| GET | `/export/movies.json` | Export JSON (téléchargement) |
+| GET | `/export/movies.csv` | Export CSV (téléchargement) |
+
+Documentation interactive : http://localhost:8000/docs (Swagger UI auto-généré).
 
 ## Structure du projet
 
 ```
-project/
-├── backend/
-│   ├── main.py              # API FastAPI (routes /hello, /movies, /)
-│   ├── requirements.txt     # Dependances Python
-│   ├── Dockerfile           # Image Python 3.11-slim
-│   ├── test_main.py         # Tests pytest
-│   ├── .env.example         # Template de configuration
-│   └── static/
-│       └── index.html       # Frontend embarque (mode mono-conteneur)
-├── frontend/
-│   ├── index.html           # Page principale
-│   ├── style.css            # Styles premium (dark theme, glassmorphism)
-│   ├── script.js            # Logique fetch + rendu dynamique
-│   └── Dockerfile           # Image nginx:alpine
-├── docker-compose.yml       # Orchestration des 2 services
-├── .gitlab-ci.yml           # Pipeline CI/CD (test, build, deploy)
-├── k8s/                     # Manifests Kubernetes (TME 7)
-│   ├── namespace.yaml       # Namespace cinescope
-│   ├── configmap.yaml       # Configuration (TMDB_API_KEY, ENV)
-│   ├── backend-deployment.yaml   # Deployment backend (2 replicas)
-│   ├── backend-service.yaml      # Service ClusterIP backend
-│   ├── frontend-deployment.yaml  # Deployment frontend (2 replicas)
-│   ├── frontend-service.yaml     # Service NodePort frontend (30080)
-│   ├── deploy.sh            # Script de deploiement complet
-│   └── teardown.sh          # Script de nettoyage
+.
+├── backend/                # API FastAPI + tests
+│   ├── main.py
+│   ├── test_main.py
+│   ├── requirements.txt
+│   └── Dockerfile
+├── frontend/               # SPA légère
+│   ├── index.html
+│   ├── style.css
+│   ├── script.js
+│   └── Dockerfile
+├── k8s/                    # Manifests Kubernetes
+│   ├── namespace.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   ├── postgres-{deployment,service,pvc}.yaml
+│   ├── backend-{deployment,service,hpa}.yaml
+│   ├── frontend-{deployment,service,hpa}.yaml
+│   ├── ingress.yaml
+│   ├── deploy.sh
+│   └── teardown.sh
+├── docs/                   # Génération du rapport PDF
+│   ├── gen_diagrams.py
+│   ├── gen_rapport.py
+│   └── rapport_cinescope.pdf
+├── docker-compose.yml
+├── .gitlab-ci.yml
+├── start.sh
 └── README.md
 ```
 
-## Commandes Docker utiles
+## Tests
+
+Le backend a 11 tests pytest. Pour les lancer en local il faut une Postgres
+joignable (le `docker compose up db` suffit) :
 
 ```bash
-# Build et lancement
-docker-compose up --build
-
-# Lancement en arriere-plan
-docker-compose up -d
-
-# Voir les logs
-docker-compose logs -f
-docker-compose logs backend
-docker-compose logs frontend
-
-# Arreter les services
-docker-compose down
-
-# Rebuild un seul service
-docker-compose build backend
-
-# Inspecter un conteneur
-docker inspect films-backend
-
-# Executer une commande dans un conteneur
-docker exec -it films-backend sh
-
-# Stats des conteneurs
-docker stats
+docker compose up -d db
+cd backend
+pip install -r requirements.txt
+pytest test_main.py -v
 ```
 
-## Variables d'environnement
+En CI/CD, GitLab démarre automatiquement un conteneur `postgres:16-alpine`
+en service du job de test.
 
-| Variable       | Description                          | Defaut        |
-|---------------|--------------------------------------|---------------|
-| `TMDB_API_KEY` | Cle API TMDB (v4 bearer token)      | _(vide = mock)_ |
-
-## Endpoints API
-
-| Methode | Route              | Description                       |
-|---------|-------------------|-----------------------------------|
-| GET     | `/hello`          | Health check + mode (tmdb/mock)   |
-| GET     | `/movies?limit=N` | Liste des films (1 <= N <= 100)   |
-| GET     | `/search?q=X`     | Recherche par titre/genre/realisateur |
-| GET     | `/`               | Frontend embarque (mono-conteneur)|
-
-## CI/CD
-
-Le pipeline GitLab CI comprend 3 stages :
-
-1. **test** : Execute `pytest` sur les endpoints du backend
-2. **build** : Construit les images Docker `films-backend` et `films-frontend`
-3. **deploy** : Deploiement simule (echo)
-
-## Kubernetes (TME 7)
-
-Deploiement de l'application sur un cluster Minikube.
-
-### Architecture K8s
-
-```
-┌─ Namespace: cinescope ──────────────────────────────────┐
-│                                                          │
-│  ┌─ Deployment: frontend ──┐  ┌─ Deployment: backend ──┐│
-│  │  Pod (nginx)            │  │  Pod (FastAPI)          ││
-│  │  Pod (nginx)            │  │  Pod (FastAPI)          ││
-│  └────────┬────────────────┘  └────────┬────────────────┘│
-│           │                            │                 │
-│  ┌────────▼────────────┐  ┌────────────▼──────────────┐  │
-│  │ Service: frontend   │  │ Service: backend          │  │
-│  │ NodePort :30080     │  │ ClusterIP :8000           │  │
-│  └─────────────────────┘  └───────────────────────────┘  │
-│                                                          │
-│  ┌─ ConfigMap: cinescope-config ──────────────────────┐  │
-│  │ ENV=production  TMDB_API_KEY=...                   │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Deploiement rapide
+## Déploiement Kubernetes
 
 ```bash
 cd k8s
@@ -168,43 +119,42 @@ cd k8s
 ```
 
 Le script :
-1. Demarre Minikube si besoin
-2. Build les images dans le Docker de Minikube
-3. Applique tous les manifests
-4. Attend que les pods soient ready
-5. Affiche l'URL d'acces
+1. Démarre Minikube si besoin
+2. Active les addons `metrics-server` (HPA) et `ingress` (nginx)
+3. Build les images dans le Docker de Minikube
+4. Applique tous les manifests
+5. Affiche l'URL à utiliser (Ingress sur `cinescope.local` ou NodePort)
 
-### Commandes K8s utiles
-
-```bash
-# Voir tous les objets du namespace
-kubectl -n cinescope get all
-
-# Logs d'un pod backend
-kubectl -n cinescope logs -l tier=backend
-
-# Scaler le backend a 4 replicas
-kubectl -n cinescope scale deployment backend --replicas=4
-
-# Voir les events (debug)
-kubectl -n cinescope get events --sort-by='.lastTimestamp'
-
-# Acceder au frontend
-minikube service frontend -n cinescope
-
-# Nettoyage complet
-./teardown.sh
+Pour utiliser l'Ingress, ajouter dans `/etc/hosts` :
+```
+<minikube_ip>  cinescope.local
 ```
 
-### Concepts K8s utilises
+### Concepts K8s utilisés
 
-| Concept | Utilisation dans le projet |
-|---------|---------------------------|
-| **Namespace** | Isolation des ressources dans `cinescope` |
-| **Deployment** | Gestion des replicas backend (2) et frontend (2) |
-| **Service ClusterIP** | Communication interne backend (non expose) |
-| **Service NodePort** | Acces externe au frontend sur le port 30080 |
-| **ConfigMap** | Injection de `TMDB_API_KEY` et `ENV` |
-| **Probes** | `readinessProbe` et `livenessProbe` sur `/hello` |
-| **Resources** | Limites CPU/memoire par conteneur |
-| **Scaling** | `kubectl scale` pour ajuster les replicas |
+| Concept | Rôle dans le projet |
+|---|---|
+| Namespace | Isolation dans `cinescope` |
+| Deployment | 2 replicas back, 2 replicas front, 1 replica db |
+| Service ClusterIP | Communication interne back ↔ db |
+| Service NodePort | Exposition front (fallback sans Ingress) |
+| Ingress (nginx) | Point d'entrée unique, routage `/api` ↔ backend |
+| ConfigMap | Variables non sensibles (DB_HOST, DB_NAME, ENV) |
+| Secret | Variables sensibles (DB_PASSWORD, TMDB_API_KEY) |
+| PersistentVolumeClaim | Persistance des données Postgres |
+| HPA | Autoscaling 2-5 replicas back, 2-4 front (cible 70% CPU) |
+| Probes | Readiness + liveness sur `/hello` (back), `pg_isready` (db) |
+
+## CI/CD
+
+Pipeline GitLab à 3 stages :
+1. **test** — pytest sur le backend (avec Postgres en service), rapport JUnit
+2. **build** — build des images Docker, push vers GitLab Container Registry
+3. **deploy** — simulation de déploiement (uniquement sur `main`)
+
+## Nettoyage
+
+```bash
+docker compose down -v       # supprime aussi le volume postgres
+cd k8s && ./teardown.sh      # supprime tout le namespace
+```
