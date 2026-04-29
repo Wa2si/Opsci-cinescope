@@ -1,28 +1,38 @@
 import os
+import csv
+import io
 import json
-import sqlite3
+import time
 import asyncio
 import httpx
+import psycopg2
+import psycopg2.extras
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
-# --- config ---
 
+START_TIME = time.time()  # pour /status
+
+# config TMDB (clé chargée depuis l'env, sinon mode mock)
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 TMDB_BASE = "https://api.themoviedb.org/3"
 
-# chemin de la base de donnees (peut etre override par variable d'env)
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "films.db"))
+# config postgres
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "cinescope")
+DB_USER = os.getenv("DB_USER", "cinescope")
+DB_PASS = os.getenv("DB_PASSWORD", "cinescope")
 
-# intervalle de rafraichissement en secondes (1 heure)
+# refresh toutes les heures (3600s)
 REFRESH_INTERVAL = 3600
 
 
-# --- donnees mock (fallback sans cle TMDB) ---
-
+# Films "mock" utilisés si pas de clé TMDB.
+# TODO: idéalement à sortir dans un mock_movies.json mais bon, ça fait le job
 MOCK_MOVIES = [
     {"id": 27205, "title": "Inception", "year": "2010", "director": "Christopher Nolan",
      "description": "Un voleur s'introduit dans les rêves des autres pour voler leurs secrets les plus enfouis.",
@@ -106,6 +116,7 @@ MOCK_MOVIES = [
      "genre": "Thriller"},
 ]
 
+# IDs de genre TMDB -> nom (pris depuis /genre/movie/list)
 GENRE_MAP = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy",
     80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family",
@@ -115,19 +126,35 @@ GENRE_MAP = {
 }
 
 
-# --- base de donnees SQLite ---
+# ============================================================
+# Accès BDD
+# ============================================================
 
 def get_conn():
-    """retourne une connexion sqlite avec row factory (acces par nom de colonne)"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASS,
+    )
+
+
+def wait_for_db(tries=30, delay=2):
+    # Quand on lance docker-compose, postgres met quelques secondes à
+    # accepter les connexions. On retry au lieu de crasher direct.
+    for i in range(tries):
+        try:
+            c = get_conn()
+            c.close()
+            return
+        except Exception as e:
+            print(f"[db] pas encore pret ({i+1}/{tries}): {e}")
+            time.sleep(delay)
+    raise RuntimeError("postgres injoignable apres plusieurs essais")
 
 
 def init_db():
-    """cree la table si elle existe pas encore"""
     conn = get_conn()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS films (
             id           INTEGER PRIMARY KEY,
             title        TEXT NOT NULL,
@@ -154,24 +181,29 @@ def init_db():
 
 def count_films():
     conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM films").fetchone()[0]
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM films")
+    n = cur.fetchone()[0]
     conn.close()
     return n
 
 
 def upsert_film(conn, film):
-    """insert ou met a jour un film (on ecrase pas le director si on le connait deja)"""
-    conn.execute("""
+    # Subtilité ON CONFLICT : si TMDB renvoie 'N/A' pour le director
+    # (ce qui arrive sur l'endpoint /popular qui ne retourne pas le crew),
+    # on garde la valeur déjà en base si on l'avait récup via le détail.
+    cur = conn.cursor()
+    cur.execute("""
         INSERT INTO films (id, title, year, director, description, image_url, genre, updated_at)
-        VALUES (:id, :title, :year, :director, :description, :image_url, :genre, CURRENT_TIMESTAMP)
-        ON CONFLICT(id) DO UPDATE SET
-            title       = excluded.title,
-            year        = excluded.year,
-            description = excluded.description,
-            image_url   = excluded.image_url,
-            genre       = excluded.genre,
+        VALUES (%(id)s, %(title)s, %(year)s, %(director)s, %(description)s, %(image_url)s, %(genre)s, CURRENT_TIMESTAMP)
+        ON CONFLICT (id) DO UPDATE SET
+            title       = EXCLUDED.title,
+            year        = EXCLUDED.year,
+            description = EXCLUDED.description,
+            image_url   = EXCLUDED.image_url,
+            genre       = EXCLUDED.genre,
             director    = CASE
-                WHEN excluded.director != 'N/A' THEN excluded.director
+                WHEN EXCLUDED.director <> 'N/A' THEN EXCLUDED.director
                 ELSE films.director
             END,
             updated_at  = CURRENT_TIMESTAMP
@@ -179,57 +211,68 @@ def upsert_film(conn, film):
 
 
 def upsert_detail(conn, detail):
-    """met a jour les champs detail d'un film (trailer, cast, etc.)"""
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         UPDATE films SET
-            director     = :director,
-            backdrop_url = :backdrop_url,
-            tagline      = :tagline,
-            runtime      = :runtime,
-            vote_average = :vote_average,
-            vote_count   = :vote_count,
-            trailer_key  = :trailer_key,
-            cast_json    = :cast_json,
-            genres_json  = :genres_json,
+            director     = %(director)s,
+            backdrop_url = %(backdrop_url)s,
+            tagline      = %(tagline)s,
+            runtime      = %(runtime)s,
+            vote_average = %(vote_average)s,
+            vote_count   = %(vote_count)s,
+            trailer_key  = %(trailer_key)s,
+            cast_json    = %(cast_json)s,
+            genres_json  = %(genres_json)s,
             has_detail   = 1,
             updated_at   = CURRENT_TIMESTAMP
-        WHERE id = :id
+        WHERE id = %(id)s
     """, detail)
+
+
+def _dict_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def get_films(limit=20):
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT * FROM films ORDER BY updated_at DESC LIMIT ?", (limit,)
-    ).fetchall()
+    cur = _dict_cursor(conn)
+    cur.execute("SELECT * FROM films ORDER BY updated_at DESC LIMIT %s", (limit,))
+    rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_film_by_id(film_id):
     conn = get_conn()
-    row = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+    cur = _dict_cursor(conn)
+    cur.execute("SELECT * FROM films WHERE id = %s", (film_id,))
+    row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
 
 
 def search_in_db(query, limit=20):
-    """recherche dans la db par titre, realisateur, genre, description"""
-    q = f"%{query}%"
+    # Échappe % et _ avant de les passer à LIKE, sinon "100%" matche tout.
+    safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    q = f"%{safe}%"
     conn = get_conn()
-    rows = conn.execute("""
+    cur = _dict_cursor(conn)
+    cur.execute("""
         SELECT * FROM films
-        WHERE lower(title)       LIKE lower(?)
-           OR lower(director)    LIKE lower(?)
-           OR lower(genre)       LIKE lower(?)
-           OR lower(description) LIKE lower(?)
-        LIMIT ?
-    """, (q, q, q, q, limit)).fetchall()
+        WHERE lower(title)       LIKE lower(%s)
+           OR lower(director)    LIKE lower(%s)
+           OR lower(genre)       LIKE lower(%s)
+           OR lower(description) LIKE lower(%s)
+        LIMIT %s
+    """, (q, q, q, q, limit))
+    rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-# --- appels TMDB ---
+# ============================================================
+# Appels TMDB
+# ============================================================
 
 async def tmdb_get(endpoint, params=None):
     headers = {
@@ -237,17 +280,14 @@ async def tmdb_get(endpoint, params=None):
         "accept": "application/json",
     }
     async with httpx.AsyncClient(timeout=10) as client:
-        res = await client.get(
-            f"{TMDB_BASE}{endpoint}",
-            headers=headers,
-            params=params or {},
-        )
+        res = await client.get(f"{TMDB_BASE}{endpoint}", headers=headers, params=params or {})
         res.raise_for_status()
         return res.json()
 
 
 def normalize_tmdb_movie(m):
-    """convertit un film tmdb au format de notre db"""
+    # On reformate un film TMDB pour qu'il rentre dans notre table.
+    # /popular ne renvoie pas le réalisateur -> "N/A" en attendant le détail.
     genre_ids = m.get("genre_ids", [])
     genre = GENRE_MAP.get(genre_ids[0], "Unknown") if genre_ids else "Unknown"
     release = m.get("release_date", "") or ""
@@ -256,18 +296,15 @@ def normalize_tmdb_movie(m):
         "id": m.get("id"),
         "title": m.get("title", "Unknown"),
         "year": release[:4] if len(release) >= 4 else "N/A",
-        "director": "N/A",  # pas dispo dans /popular, recupere au detail
+        "director": "N/A",
         "description": m.get("overview", ""),
         "image_url": f"https://image.tmdb.org/t/p/w500{poster}" if poster else "",
         "genre": genre,
     }
 
 
-# --- tache de rafraichissement ---
-
 async def refresh_from_source():
-    """recupere les films depuis TMDB (ou mock) et met a jour la db"""
-    print("[refresh] debut du rafraichissement de la db...")
+    print("[refresh] mise a jour de la db...")
     if TMDB_API_KEY:
         try:
             data = await tmdb_get("/movie/popular", {"language": "fr-FR", "page": 1})
@@ -277,52 +314,52 @@ async def refresh_from_source():
                 upsert_film(conn, f)
             conn.commit()
             conn.close()
-            print(f"[refresh] {len(films)} films mis a jour depuis TMDB")
+            print(f"[refresh] {len(films)} films via TMDB")
             return
         except Exception as e:
-            print(f"[refresh] erreur TMDB: {e}, fallback sur mock")
+            # Si TMDB tombe, on ne veut pas casser le serveur -> on bascule sur les mocks.
+            print(f"[refresh] TMDB ko ({e}), fallback mock")
 
-    # pas de cle ou erreur → on charge les mocks
     conn = get_conn()
     for f in MOCK_MOVIES:
         upsert_film(conn, f)
     conn.commit()
     conn.close()
-    print(f"[refresh] {len(MOCK_MOVIES)} films mock charges en db")
+    print(f"[refresh] {len(MOCK_MOVIES)} films mock charges")
 
 
 async def refresh_loop():
-    """tourne en arriere-plan, rafraichit la db toutes les REFRESH_INTERVAL secondes"""
     while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         try:
             await refresh_from_source()
         except Exception as e:
-            print(f"[refresh] echec du cycle de rafraichissement: {e}")
+            print(f"[refresh] cycle ko: {e}")
 
 
-# --- demarrage de l'app ---
+# ============================================================
+# Lifecycle (startup / shutdown)
+# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # au demarrage : init db puis chargement initial si vide
+    # postgres peut etre lent a demarrer (surtout dans Compose)
+    wait_for_db()
     init_db()
     if count_films() == 0:
-        print("[startup] db vide, chargement initial...")
+        print("[startup] db vide, premier chargement")
         await refresh_from_source()
     else:
-        print(f"[startup] db deja chargee ({count_films()} films)")
+        print(f"[startup] db ok ({count_films()} films)")
 
-    # lance la boucle de rafraichissement en arriere-plan
     task = asyncio.create_task(refresh_loop())
     yield
-    # a l'arret on annule la tache
     task.cancel()
 
 
-app = FastAPI(title="Films API", lifespan=lifespan)
+app = FastAPI(title="Cinescope API", lifespan=lifespan)
 
-# on autorise tout pour le CORS sinon le front peut pas fetch
+# CORS: en dev on ouvre tout. En prod il faudrait restreindre à l'origine du front.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -331,33 +368,32 @@ app.add_middleware(
 )
 
 
-# --- routes ---
+# ============================================================
+# Routes
+# ============================================================
 
 @app.get("/hello")
 async def hello():
-    """health check + infos sur l'etat de la db"""
     mode = "tmdb" if TMDB_API_KEY else "mock"
     return {"status": "ok", "mode": mode, "films_en_db": count_films()}
 
 
 @app.get("/movies")
 async def get_movies(limit: int = Query(default=20, ge=1, le=100)):
-    """retourne les films depuis la db (pas d'appel TMDB direct)"""
     return get_films(limit)
 
 
 @app.get("/movie/{movie_id}")
 async def get_movie_detail(movie_id: int = Path(...)):
-    """detail d'un film - si pas en cache on fetch TMDB et on stocke en db"""
     film = get_film_by_id(movie_id)
 
-    # si on a deja le detail complet en db, on retourne direct
+    # Si on a déjà le détail en cache, on renvoie direct (pas de re-call TMDB).
     if film and film.get("has_detail"):
         film["cast"] = json.loads(film["cast_json"] or "[]")
         film["genres"] = json.loads(film["genres_json"] or "[]")
         return film
 
-    # sinon on fetch le detail depuis TMDB et on le met en cache
+    # Sinon on tape sur TMDB pour avoir le casting + le trailer.
     if TMDB_API_KEY and film:
         try:
             data = await tmdb_get(
@@ -365,14 +401,14 @@ async def get_movie_detail(movie_id: int = Path(...)):
                 {"language": "fr-FR", "append_to_response": "videos,credits"},
             )
 
-            # chercher le realisateur dans le crew
+            # Récupération du réalisateur (premier crew avec job=Director)
             director = "N/A"
             for person in data.get("credits", {}).get("crew", []):
                 if person.get("job") == "Director":
                     director = person["name"]
                     break
 
-            # trailer youtube (fr de preference)
+            # Trailer YouTube : on prend la VF si dispo, sinon n'importe lequel
             trailer_key = None
             for v in data.get("videos", {}).get("results", []):
                 if v.get("type") == "Trailer" and v.get("site") == "YouTube":
@@ -380,7 +416,7 @@ async def get_movie_detail(movie_id: int = Path(...)):
                     if v.get("iso_639_1") == "fr":
                         break
 
-            # top 8 du casting
+            # On garde les 8 premiers acteurs (suffisant pour la modal)
             cast_list = []
             for c in data.get("credits", {}).get("cast", [])[:8]:
                 photo = None
@@ -394,7 +430,6 @@ async def get_movie_detail(movie_id: int = Path(...)):
 
             genres = [g["name"] for g in data.get("genres", [])]
             backdrop = data.get("backdrop_path") or ""
-            poster = data.get("poster_path") or ""
 
             detail = {
                 "id": movie_id,
@@ -409,7 +444,6 @@ async def get_movie_detail(movie_id: int = Path(...)):
                 "genres_json": json.dumps(genres),
             }
 
-            # on stocke le detail en db pour pas rappeler TMDB la prochaine fois
             conn = get_conn()
             upsert_detail(conn, detail)
             conn.commit()
@@ -419,11 +453,10 @@ async def get_movie_detail(movie_id: int = Path(...)):
             film["cast"] = cast_list
             film["genres"] = genres
             return film
-
         except Exception:
-            pass  # fallback sur ce qu'on a en db
+            # Si TMDB tombe pendant le détail, tant pis : on rend ce qu'on a en BDD.
+            pass
 
-    # pas de cle ou erreur : on retourne ce qu'on a en db
     if film:
         film["cast"] = json.loads(film.get("cast_json") or "[]")
         film["genres"] = json.loads(film.get("genres_json") or "[]")
@@ -441,25 +474,84 @@ async def search_movies(q: str = Query(default="", min_length=0)):
     if not query:
         return get_films(20)
 
-    # si on a la cle on cherche sur tmdb et on stocke les resultats en db
+    # On regarde d'abord en BDD. Si on trouve qqch on s'arrête là, pas la peine
+    # de spammer TMDB. La BDD est notre cache.
+    results = search_in_db(query)
+    if results:
+        return results
+
+    # Rien en BDD -> on demande à TMDB et on upsert les résultats dans la table.
+    # Comme ça la prochaine fois qu'on cherche pareil, ça sortira direct de la BDD.
     if TMDB_API_KEY:
         try:
             data = await tmdb_get("/search/movie", {"language": "fr-FR", "query": query})
-            results = [normalize_tmdb_movie(m) for m in data.get("results", [])[:20]]
-            conn = get_conn()
-            for f in results:
-                upsert_film(conn, f)
-            conn.commit()
-            conn.close()
-            return results
+            new_films = [normalize_tmdb_movie(m) for m in data.get("results", [])[:20]]
+            if new_films:
+                conn = get_conn()
+                for f in new_films:
+                    upsert_film(conn, f)
+                conn.commit()
+                conn.close()
+            return new_films
         except Exception:
             pass
 
-    # fallback : recherche dans la db locale
-    return search_in_db(query)
+    return []
 
 
-# --- fichiers statiques (mode mono-conteneur) ---
+# --- exports (TME 3) ---
+
+@app.get("/export/movies.json")
+async def export_movies_json():
+    films = get_films(limit=1000)
+    return Response(
+        content=json.dumps(films, ensure_ascii=False, indent=2, default=str),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=movies_export.json"},
+    )
+
+
+@app.get("/export/movies.csv")
+async def export_movies_csv():
+    films = get_films(limit=1000)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "title", "year", "director", "genre", "description"])
+    for f in films:
+        w.writerow([
+            f.get("id", ""),
+            f.get("title", ""),
+            f.get("year", ""),
+            f.get("director", ""),
+            f.get("genre", ""),
+            (f.get("description") or "").replace("\n", " "),
+        ])
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=movies_export.csv"},
+    )
+
+
+@app.get("/status")
+async def status():
+    # Petit dashboard pratique pour la démo de soutenance.
+    up = int(time.time() - START_TIME)
+    h = up // 3600
+    m = (up % 3600) // 60
+    s = up % 60
+    return {
+        "status": "running",
+        "mode": "tmdb" if TMDB_API_KEY else "mock",
+        "films_en_db": count_films(),
+        "uptime": f"{h}h{m:02d}m{s:02d}s",
+        "uptime_seconds": up,
+        "refresh_interval_sec": REFRESH_INTERVAL,
+    }
+
+
+# Mode mono-conteneur (utilisé surtout pour le TME 5 §étape 3) :
+# si un dossier static/ est présent, on sert aussi le front depuis le backend.
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
