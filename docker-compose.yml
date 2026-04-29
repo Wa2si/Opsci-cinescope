@@ -1,7 +1,28 @@
-# docker compose pour lancer le back + front
-# usage: docker compose up --build
+# 3 services : postgres + backend + frontend
+# Pour tout lancer : docker compose up --build  (ou ./start.sh)
 
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: cinescope-db
+    environment:
+      POSTGRES_DB: cinescope
+      POSTGRES_USER: cinescope
+      POSTGRES_PASSWORD: cinescope
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    # Healthcheck obligatoire ici, sinon le backend démarre avant
+    # que postgres ait fini de s'init et plante.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cinescope"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - films-net
+
   backend:
     build: ./backend
     image: films-backend
@@ -9,10 +30,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - TMDB_API_KEY=${TMDB_API_KEY:-}
-      - DB_PATH=/data/films.db     # db dans le volume pour la persistance
-    volumes:
-      - films_db:/data             # les donnees survivent aux redemarrages
+      - TMDB_API_KEY=${TMDB_API_KEY:-}   # vide -> mode mock
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=cinescope
+      - DB_USER=cinescope
+      - DB_PASSWORD=cinescope
+    depends_on:
+      db:
+        condition: service_healthy
     networks:
       - films-net
 
@@ -21,7 +47,7 @@ services:
     image: films-frontend
     container_name: films-frontend
     ports:
-      - "8080:80"    # on mappe le 80 de nginx sur 8080
+      - "8080:80"
     depends_on:
       - backend
     networks:
@@ -32,4 +58,4 @@ networks:
     driver: bridge
 
 volumes:
-  films_db:    # volume nomme pour persister la base sqlite
+  pg_data:
