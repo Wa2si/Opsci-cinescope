@@ -96,6 +96,37 @@ def test_export_csv(client):
     assert "director" in first_line
 
 
+# --- pagination (TME §7) ---
+
+def test_movies_paginated_format(client):
+    # Quand "page" est passe, on doit recevoir un dict avec items + meta.
+    resp = client.get("/movies?page=1&page_size=5")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, dict)
+    assert "items" in data
+    assert "page" in data
+    assert "total_pages" in data
+    assert len(data["items"]) <= 5
+    assert data["page"] == 1
+
+
+def test_movies_paginated_page2(client):
+    # On doit pouvoir aller chercher la page 2.
+    resp = client.get("/movies?page=2&page_size=5")
+    assert resp.status_code == 200
+    assert resp.json()["page"] == 2
+
+
+# --- recommandations (TME §7) ---
+
+def test_similar_movies(client):
+    resp = client.get("/movie/27205/similar")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert isinstance(data, list)
+
+
 # --- /status ---
 
 def test_status(client):

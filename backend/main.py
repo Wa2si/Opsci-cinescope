@@ -242,6 +242,20 @@ def get_films(limit=20):
     return [dict(r) for r in rows]
 
 
+def get_films_page(page, page_size):
+    # pagination en BDD avec OFFSET/LIMIT
+    offset = (page - 1) * page_size
+    conn = get_conn()
+    cur = _dict_cursor(conn)
+    cur.execute(
+        "SELECT * FROM films ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+        (page_size, offset),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_film_by_id(film_id):
     conn = get_conn()
     cur = _dict_cursor(conn)
@@ -307,14 +321,21 @@ async def refresh_from_source():
     print("[refresh] mise a jour de la db...")
     if TMDB_API_KEY:
         try:
-            data = await tmdb_get("/movie/popular", {"language": "fr-FR", "page": 1})
-            films = [normalize_tmdb_movie(m) for m in data.get("results", [])][:20]
+            # On charge 5 pages TMDB d'un coup (= 100 films max) pour avoir
+            # de quoi paginer cote frontend. Si une page foire on continue.
+            all_films = []
+            for p in range(1, 6):
+                try:
+                    data = await tmdb_get("/movie/popular", {"language": "fr-FR", "page": p})
+                    all_films.extend(normalize_tmdb_movie(m) for m in data.get("results", []))
+                except Exception as e:
+                    print(f"[refresh] page {p} ko: {e}")
             conn = get_conn()
-            for f in films:
+            for f in all_films:
                 upsert_film(conn, f)
             conn.commit()
             conn.close()
-            print(f"[refresh] {len(films)} films via TMDB")
+            print(f"[refresh] {len(all_films)} films via TMDB")
             return
         except Exception as e:
             # Si TMDB tombe, on ne veut pas casser le serveur -> on bascule sur les mocks.
@@ -379,7 +400,25 @@ async def hello():
 
 
 @app.get("/movies")
-async def get_movies(limit: int = Query(default=20, ge=1, le=100)):
+async def get_movies(
+    limit: int = Query(default=20, ge=1, le=100),
+    page: int = Query(default=None, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+):
+    # Si "page" est passe -> mode pagine (renvoie un objet avec metadonnees).
+    # Sinon on garde l'ancien comportement (liste plate) pour ne pas casser
+    # les anciens appels du front et les tests existants.
+    if page is not None:
+        total = count_films()
+        items = get_films_page(page, page_size)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        return {
+            "items": items,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+        }
     return get_films(limit)
 
 
@@ -466,6 +505,35 @@ async def get_movie_detail(movie_id: int = Path(...)):
         return film
 
     return {"error": "Film non trouvé"}
+
+
+@app.get("/movie/{movie_id}/similar")
+async def get_similar(movie_id: int = Path(...)):
+    # Films similaires (TME §7 "recommandations").
+    # En mode TMDB on tape /movie/{id}/similar et on upsert pour pouvoir
+    # rouvrir la modal sur un similar (faut que le film soit en BDD).
+    # En mode mock on renvoie juste 6 autres films de la BDD au hasard.
+    if TMDB_API_KEY:
+        try:
+            data = await tmdb_get(
+                f"/movie/{movie_id}/similar",
+                {"language": "fr-FR", "page": 1},
+            )
+            sims = [normalize_tmdb_movie(m) for m in data.get("results", [])][:8]
+            sims = [s for s in sims if s.get("id")]
+            if sims:
+                conn = get_conn()
+                for f in sims:
+                    upsert_film(conn, f)
+                conn.commit()
+                conn.close()
+            return sims
+        except Exception:
+            pass
+
+    # fallback : 8 autres films de la BDD
+    others = [f for f in get_films(limit=20) if f.get("id") != movie_id][:8]
+    return others
 
 
 @app.get("/search")
