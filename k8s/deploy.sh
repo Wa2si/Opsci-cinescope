@@ -44,7 +44,23 @@ kubectl apply -f frontend-deployment.yaml
 kubectl apply -f frontend-service.yaml
 kubectl apply -f backend-hpa.yaml
 kubectl apply -f frontend-hpa.yaml
-kubectl apply -f ingress.yaml
+
+# attente que le webhook ingress-nginx soit pret avant d'appliquer l'ingress
+# (le pod peut etre Ready avant que le service webhook accepte les requetes)
+echo "Attente du webhook ingress-nginx..."
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=180s
+# retry jusqu'a 6 fois (le webhook met parfois ~30s a s'enregistrer)
+for i in {1..6}; do
+  if kubectl apply -f ingress.yaml 2>/dev/null; then
+    echo "Ingress applique"
+    break
+  fi
+  echo "Webhook pas encore pret, retry dans 10s... ($i/6)"
+  sleep 10
+done
 
 # 8. on attend que tout soit pret
 echo "[8/8] Attente des pods..."
