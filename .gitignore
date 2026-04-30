@@ -1,4 +1,5 @@
 .env
+.env.*
 k8s/secret.yaml
 __pycache__/
 *.pyc
@@ -6,3 +7,25 @@ __pycache__/
 RAPPORT.md
 films.db
 opsci2025_*.md
+
+# documents personnels (rapports, lettres, brouillons)
+docs/
+*.pdf
+*.md.backup
+
+# fichiers metadata Windows/WSL
+*:Zone.Identifier
+Zone.Identifier
+
+# logs et fichiers temporaires
+*.log
+*.tmp
+.DS_Store
+
+# secrets et credentials
+*.pem
+*.key
+*_token*
+*_secret*
+.netrc
+credentials.json
